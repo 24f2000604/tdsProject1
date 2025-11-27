@@ -1,11 +1,16 @@
 """Basic Flask app with CORS enabled."""
 
+from __future__ import annotations
+
 from datetime import datetime
+import json
 import os
+from typing import Any, Dict
 
 import dotenv
 from flask import Flask, jsonify, request
 from flask_cors import CORS
+from werkzeug.exceptions import BadRequest
 
 from aiTest import solve_quiz_question
 
@@ -49,23 +54,55 @@ def create_app(config: dict | None = None) -> Flask:
 
 	@app.post("/api/quiz_solver")
 	def quiz_solver():
-		"""Validate the submitted secret against the configured one."""
+		"""Validate payload, verify secret, and trigger the autonomous quiz solver."""
 
-		payload = request.get_json(silent=True) or {}
-		submitted_secret = payload.get("secret")
-		result = solve_quiz_question(submitted_secret, USER_SECRET)
+		try:
+			payload = request.get_json()
+		except BadRequest:
+			return jsonify({"error": "Invalid JSON payload."}), 400
 
-		status_code = 200 if result.correct else 400
+		if not isinstance(payload, dict):
+			return jsonify({"error": "JSON body must be an object."}), 400
+
+		required_fields = ("email", "secret", "url")
+		missing = [field for field in required_fields if not payload.get(field)]
+		if missing:
+			return (
+				jsonify({"error": f"Missing required field(s): {', '.join(missing)}."}),
+				400,
+			)
+
+		if payload["secret"] != USER_SECRET:
+			return jsonify({"error": "Forbidden: secret mismatch."}), 403
+
+		prompt = _build_quiz_prompt(payload)
+		solver_response = solve_quiz_question(prompt, verbose=False)
+
+		if solver_response.get("status") != "completed":
+			return (
+				jsonify(
+					{
+						"status": solver_response.get("status"),
+						"message": solver_response.get("error", "Quiz solver failed."),
+						"thread_id": solver_response.get("thread_id"),
+						"run_id": solver_response.get("run_id"),
+					}
+				),
+				500,
+			)
+
 		return (
 			jsonify(
 				{
-					"app": app.config["APP_NAME"],
-					"email": USER_EMAIL,
-					"correct": result.correct,
-					"message": result.message,
+					"status": "ok",
+					"thread_id": solver_response.get("thread_id"),
+					"run_id": solver_response.get("run_id"),
+					"answer": solver_response.get("answer"),
+					"attachments": solver_response.get("attachments", []),
+					"email": payload["email"],
 				}
 			),
-			status_code,
+			200,
 		)
 
 	return app
@@ -77,4 +114,27 @@ app = create_app()
 if __name__ == "__main__":
 	# Use Flask's built-in development server
 	app.run(host="0.0.0.0", port=5000, debug=True)
+
+
+def _build_quiz_prompt(payload: Dict[str, Any]) -> str:
+	"""Create a detailed instruction block for the autonomous quiz solver."""
+
+	additional_context = payload.copy()
+	for key in ("secret", "email"):
+		additional_context.pop(key, None)
+
+	context_block = json.dumps(additional_context, indent=2) if additional_context else "{}"
+
+	return (
+		"You are an autonomous data-analysis agent tasked with solving a quiz.\n"
+		"Follow this workflow strictly: scrape the provided quiz URL, download any linked data,"
+		" run pandas-based analysis, and produce the final numeric/text answer.\n"
+		"When submitting any final API request back to the quiz origin, include the student's"
+		f" email '{payload['email']}' and secret '{payload['secret']}'.\n"
+		"Use the tools defined in your instructions (web_scraper, web_downloader, pdf_scraper,"
+		" code_interpreter, etc.) to gather data.\n"
+		f"Quiz URL: {payload['url']}\n"
+		f"Additional context (JSON): {context_block}\n"
+		"Deliver the final answer plainly at the end of your reasoning."
+	)
 

@@ -4,7 +4,7 @@ import os
 import time
 import base64
 import io
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple, Optional
 from dotenv import load_dotenv
 
 # --- New Imports for Local Scraping & PDF ---
@@ -418,35 +418,84 @@ def process_run_loop(thread_id, run_id):
             break
     return run
 
+
+def _extract_assistant_response(thread_id: str) -> Tuple[str, List[str], Dict[str, Any]]:
+    """Fetch the latest assistant message and return text + image ids."""
+
+    messages = make_openai_request(f"threads/{thread_id}/messages", method="GET")
+    answer_text = ""
+    attachments: List[str] = []
+
+    for msg in messages.get("data", []):
+        if msg.get("role") != "assistant":
+            continue
+        for content_part in msg.get("content", []):
+            if content_part["type"] == "text" and not answer_text:
+                answer_text = content_part["text"]["value"].strip()
+            elif content_part["type"] == "image_file":
+                attachments.append(content_part["image_file"]["file_id"])
+        if answer_text:
+            break
+
+    return answer_text, attachments, messages
+
 # --- MAIN FLOW ---
 
-def solve_quiz_question(question_prompt):
+def solve_quiz_question(question_prompt: str, *, verbose: bool = True) -> Dict[str, Any]:
+    """Execute the autonomous agent pipeline and return the assistant's answer."""
+
+    result: Dict[str, Any] = {
+        "status": "error",
+        "answer": None,
+        "thread_id": None,
+        "run_id": None,
+        "attachments": [],
+    }
+
     try:
         assistant = create_assistant()
         assistant_id = assistant['id']
-        print("Creating Run...")
-        
+        if verbose:
+            print("Creating Run...")
+
         run_payload = {
             "assistant_id": assistant_id,
             "thread": {"messages": [{"role": "user", "content": question_prompt}]},
-            "model": MODEL_NAME
+            "model": MODEL_NAME,
         }
         run = make_openai_request("threads/runs", method="POST", data=run_payload)
-        final_run = process_run_loop(run['thread_id'], run['id'])
+        result.update({"thread_id": run["thread_id"], "run_id": run["id"]})
 
-        if final_run and final_run['status'] == 'completed':
-            messages = make_openai_request(f"threads/{run['thread_id']}/messages", method="GET")
-            if messages.get('data'):
+        final_run = process_run_loop(run['thread_id'], run['id'])
+        final_status = final_run.get('status') if final_run else 'failed'
+        result["status"] = final_status
+
+        if final_status == 'completed':
+            answer_text, attachments, messages = _extract_assistant_response(run['thread_id'])
+            result.update({
+                "answer": answer_text,
+                "attachments": attachments,
+                "messages": messages,
+            })
+            if verbose:
                 print("\n--- Final AI Message ---")
-                latest_msg = messages['data'][0]
-                for content_part in latest_msg['content']:
-                    if content_part['type'] == 'text':
-                        print(content_part['text']['value'])
-                    elif content_part['type'] == 'image_file':
-                        print(f"[Image File Generated: {content_part['image_file']['file_id']}]")
+                if answer_text:
+                    print(answer_text)
+                if attachments:
+                    for img in attachments:
+                        print(f"[Image File Generated: {img}]")
+        else:
+            result["error"] = final_run.get('last_error') if final_run else 'Unknown failure'
+            if verbose:
+                print(f"Run ended with status {final_status}: {result.get('error')}")
 
     except Exception as e:
-        print(f"\n[Fatal Error] {e}")
+        result["status"] = "error"
+        result["error"] = str(e)
+        if verbose:
+            print(f"\n[Fatal Error] {e}")
+
+    return result
 
 if __name__ == "__main__":
     if "YOUR_OPENAI_SK_KEY_HERE" in OPENAI_API_KEY:
@@ -462,4 +511,6 @@ if __name__ == "__main__":
 
 
 
-    solve_quiz_question(prompt)
+    response = solve_quiz_question(prompt)
+    print("\nResponse summary:")
+    print(json.dumps({k: v for k, v in response.items() if k != "messages"}, indent=2))
