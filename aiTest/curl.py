@@ -10,9 +10,10 @@ from dotenv import load_dotenv
 # --- New Imports for Local Scraping & PDF ---
 try:
     from selenium import webdriver
-    from selenium.webdriver.chrome.options import Options
-    from selenium.webdriver.chrome.service import Service
-    from webdriver_manager.chrome import ChromeDriverManager
+    # Use Firefox / geckodriver instead of Chrome
+    from selenium.webdriver.firefox.options import Options as FirefoxOptions
+    from selenium.webdriver.firefox.service import Service
+    from webdriver_manager.firefox import GeckoDriverManager
     from markdownify import markdownify as md
     import pypdf  # NEW: For handling PDFs locally
 except ImportError:
@@ -44,25 +45,40 @@ def get_user_credentials() -> Tuple[str, str]:
 # --- HELPER: Local Browser Logic ---
 
 def get_page_source_local(url: str) -> str:
-    """Uses Selenium to render the page (handling JavaScript) and returns HTML."""
-    chrome_options = Options()
-    chrome_options.add_argument("--headless")
-    chrome_options.add_argument("--no-sandbox")
-    chrome_options.add_argument("--disable-dev-shm-usage")
-    chrome_options.add_argument("--disable-gpu")
-    chrome_options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
+    """Uses Firefox/GeckoDriver to render the page (handling JavaScript) and returns HTML.
+
+    This replaces the previous Chrome-based implementation with Firefox so the
+    project can run with geckodriver. On failure, falls back to requests.get.
+    """
+    firefox_options = FirefoxOptions()
+    # headless mode
+    firefox_options.add_argument("--headless")
+    # common flags used for containerized runs
+    firefox_options.add_argument("--no-sandbox")
+    firefox_options.add_argument("--disable-dev-shm-usage")
+    # disable GPU to avoid driver issues in headless/container environments
+    firefox_options.add_argument("--disable-gpu")
+    # Keep a stable user-agent
+    firefox_options.add_argument(
+        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:102.0) Gecko/20100101 Firefox/102.0"
+    )
 
     try:
-        service = Service(ChromeDriverManager().install())
-        driver = webdriver.Chrome(service=service, options=chrome_options)
+        service = Service(GeckoDriverManager().install())
+        driver = webdriver.Firefox(service=service, options=firefox_options)
         driver.get(url)
-        time.sleep(3) 
+        time.sleep(3)
         html_content = driver.page_source
         driver.quit()
         return html_content
     except Exception as e:
         print(f"  [Error] Local scraping failed: {e}")
-        return requests.get(url).text
+        # Fallback to a simple GET when Selenium/Gecko is not available
+        try:
+            return requests.get(url).text
+        except Exception as e2:
+            print(f"  [Error] Fallback requests.get also failed: {e2}")
+            return ""
 
 # --- HELPER: File Operations (DIRECT TO OPENAI) ---
 
