@@ -10,10 +10,9 @@ from dotenv import load_dotenv
 # --- New Imports for Local Scraping & PDF ---
 try:
     from selenium import webdriver
-    # Use Firefox / geckodriver instead of Chrome
+    # Use Firefox / geckodriver (rely on system-installed geckodriver or PATH)
     from selenium.webdriver.firefox.options import Options as FirefoxOptions
     from selenium.webdriver.firefox.service import Service
-    from webdriver_manager.firefox import GeckoDriverManager
     from markdownify import markdownify as md
     import pypdf  # NEW: For handling PDFs locally
 except ImportError:
@@ -64,8 +63,14 @@ def get_page_source_local(url: str) -> str:
     )
 
     try:
-        service = Service(GeckoDriverManager().install())
-        driver = webdriver.Firefox(service=service, options=firefox_options)
+        # Prefer an explicit geckodriver path if available (e.g. installed system-wide)
+        gecko_path = "/usr/local/bin/geckodriver"
+        if os.path.exists(gecko_path):
+            service = Service(executable_path=gecko_path)
+            driver = webdriver.Firefox(service=service, options=firefox_options)
+        else:
+            # Fall back to relying on geckodriver being on PATH
+            driver = webdriver.Firefox(options=firefox_options)
         driver.get(url)
         time.sleep(3)
         html_content = driver.page_source
