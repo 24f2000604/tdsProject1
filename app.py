@@ -57,13 +57,14 @@ def create_app(config: dict | None = None) -> Flask:
 	def quiz_solver():
 		"""Validate payload, verify secret, and trigger the autonomous quiz solver."""
 
+		# Handle invalid JSON - force=True raises BadRequest on invalid JSON
 		try:
-			payload = request.get_json()
-		except BadRequest:
+			payload = request.get_json(force=True)
+		except Exception:
 			return jsonify({"error": "Invalid JSON payload."}), 400
 
-		if not isinstance(payload, dict):
-			return jsonify({"error": "JSON body must be an object."}), 400
+		if payload is None or not isinstance(payload, dict):
+			return jsonify({"error": "Invalid JSON payload."}), 400
 
 		required_fields = ("email", "secret", "url")
 		missing = [field for field in required_fields if not payload.get(field)]
@@ -121,22 +122,9 @@ if __name__ == "__main__":
 def _build_quiz_prompt(payload: Dict[str, Any]) -> str:
 	"""Create a detailed instruction block for the autonomous quiz solver."""
 
-	additional_context = payload.copy()
-	for key in ("secret", "email"):
-		additional_context.pop(key, None)
-
-	context_block = json.dumps(additional_context, indent=2) if additional_context else "{}"
-
 	return (
-		"You are an autonomous data-analysis agent tasked with solving a quiz.\n"
-		"Follow this workflow strictly: scrape the provided quiz URL, download any linked data,"
-		" run pandas-based analysis, and produce the final numeric/text answer.\n"
-		"When submitting any final API request back to the quiz origin, include the student's"
-		f" email '{payload['email']}' and secret '{payload['secret']}'.\n"
-		"Use the tools defined in your instructions (web_scraper, web_downloader, pdf_scraper,"
-		" code_interpreter, etc.) to gather data.\n"
-		f"Quiz URL: {payload['url']}\n"
-		f"Additional context (JSON): {context_block}\n"
-		"Deliver the final answer plainly at the end of your reasoning."
+		f"solve {payload['url']}, "
+		f"When posting the JSON, include 'email': '{payload['email']}' and 'secret': '{payload['secret']}' in the payload. "
+		f"keep checking any urls provided until you get the final answer. a successful response might contain urls with additional problems"
 	)
 

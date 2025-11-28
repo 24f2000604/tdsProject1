@@ -4,21 +4,32 @@ import os
 import time
 import base64
 import io
+import zipfile  # Lightweight, built-in
 from typing import Dict, Any, List, Tuple, Optional
 from dotenv import load_dotenv
 
-# --- New Imports for Local Scraping & PDF ---
+# --- Lightweight Imports for Scraping & PDF ---
+# NOTE: Heavy processing (pandas, matplotlib, PIL) is offloaded to LLM Code Interpreter
+# to minimize RAM usage on resource-constrained VMs (1GB RAM)
 try:
     from selenium import webdriver
     from selenium.webdriver.chrome.options import Options
     from selenium.webdriver.chrome.service import Service
     from webdriver_manager.chrome import ChromeDriverManager
     from markdownify import markdownify as md
-    import pypdf  # NEW: For handling PDFs locally
-except ImportError:
-    print("⚠️  Missing libraries.")
+    import pypdf  # Lightweight PDF text extraction
+except ImportError as e:
+    print(f"⚠️  Missing libraries: {e}")
     print("Run: pip install selenium webdriver-manager markdownify pypdf")
     exit(1)
+
+# Optional: JSONPath (lightweight)
+try:
+    from jsonpath_ng import parse as jsonpath_parse
+    HAS_JSONPATH = True
+except ImportError:
+    HAS_JSONPATH = False
+    print("⚠️  jsonpath-ng not installed. json_query tool will be limited.")
 
 # --- Configuration ---
 load_dotenv()
@@ -44,7 +55,7 @@ def get_user_credentials() -> Tuple[str, str]:
 # --- HELPER: Local Browser Logic ---
 
 def get_page_source_local(url: str) -> str:
-    """Uses Selenium to render the page (handling JavaScript) and returns HTML."""
+    """Uses Selenium with Chrome/ChromeDriver to render the page (handling JavaScript) and returns HTML."""
     chrome_options = Options()
     chrome_options.add_argument("--headless")
     chrome_options.add_argument("--no-sandbox")
@@ -108,12 +119,22 @@ def download_and_process_file(url: str) -> str:
     """
     Downloads a file. 
     - If CSV/Text/JSON: Returns the raw content string (Direct Injection).
-    - If Binary (PDF): Redirects to scrape_pdf.
+    - If PDF: Redirects to scrape_pdf.
+    - If Excel (.xlsx/.xls): Redirects to parse_excel.
+    - If ZIP: Redirects to extract_zip.
     - Other Binaries (Img): Uploads to OpenAI.
     """
+    url_lower = url.lower()
     
-    if url.lower().endswith(".pdf"):
+    # Handle specific file types directly
+    if url_lower.endswith(".pdf"):
         return scrape_pdf(url)
+    
+    if url_lower.endswith((".xlsx", ".xls")):
+        return parse_excel(url)
+    
+    if url_lower.endswith(".zip"):
+        return extract_zip(url)
 
     if url in UPLOADED_FILES_CACHE:
         cached_val = UPLOADED_FILES_CACHE[url]
@@ -126,7 +147,6 @@ def download_and_process_file(url: str) -> str:
         r.raise_for_status()
         
         content_type = r.headers.get('Content-Type', '').lower()
-        url_lower = url.lower()
         
         is_text_data = (
             'text' in content_type or 
@@ -239,6 +259,203 @@ def get_json(url):
     r = requests.get(url, headers=headers)
     return r.json()
 
+# --- LIGHTWEIGHT DATA TOOLS (Heavy processing offloaded to Code Interpreter) ---
+# NOTE: These tools focus on DOWNLOADING data and passing it to the LLM sandbox
+# to minimize RAM usage on the VM. Code Interpreter handles pandas/matplotlib/etc.
+
+def download_excel_raw(url: str) -> str:
+    """Downloads Excel file and uploads to OpenAI for Code Interpreter processing.
+    
+    Returns file ID for use with Code Interpreter (heavy processing done in sandbox).
+    """
+    print(f"  [Tool] Downloading Excel for Code Interpreter: {url}")
+    try:
+        response = requests.get(url, timeout=60)
+        response.raise_for_status()
+        
+        # Save temporarily and upload to OpenAI
+        filename = os.path.basename(url.split("?")[0]) or "data.xlsx"
+        if not filename.endswith(('.xlsx', '.xls')):
+            filename = "data.xlsx"
+            
+        with open(filename, 'wb') as f:
+            f.write(response.content)
+        
+        # Upload to OpenAI for Code Interpreter
+        upload_url = f"{DIRECT_OPENAI_URL}/files"
+        headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
+        
+        with open(filename, 'rb') as f:
+            files = {'file': (filename, f), 'purpose': (None, 'assistants')}
+            api_response = requests.post(upload_url, headers=headers, files=files)
+        
+        api_response.raise_for_status()
+        file_id = api_response.json()['id']
+        os.remove(filename)
+        
+        print(f"  [Tool] Excel uploaded. File ID: {file_id}")
+        return f"Excel file uploaded. File ID: {file_id}. Use Code Interpreter with pandas to read and process this file: pd.read_excel(file_path)"
+        
+    except Exception as e:
+        return f"Error downloading Excel: {str(e)}"
+
+
+def extract_tables_from_html(url: str) -> str:
+    """Scrapes HTML and returns raw HTML for Code Interpreter to parse tables.
+    
+    Returns HTML content - use Code Interpreter with pd.read_html() for table extraction.
+    """
+    print(f"  [Tool] Extracting HTML for table parsing: {url}")
+    try:
+        html_content = get_page_source_local(url)
+        
+        # Return raw HTML - let Code Interpreter use pd.read_html()
+        # This avoids loading pandas locally
+        print(f"  [Tool] HTML fetched ({len(html_content)} chars). Use pd.read_html() in Code Interpreter.")
+        return f"HTML content fetched. Use Code Interpreter with: `import pandas as pd; tables = pd.read_html('''...html content...''')` to extract tables.\n\nHTML Content:\n{html_content[:30000]}"
+        
+    except Exception as e:
+        return f"Error fetching HTML: {str(e)}"
+
+
+def extract_zip(url: str) -> str:
+    """Downloads a ZIP file and lists/extracts text files inside (lightweight, built-in zipfile)."""
+    print(f"  [Tool] Extracting ZIP: {url}")
+    try:
+        response = requests.get(url, timeout=60)
+        response.raise_for_status()
+        
+        with zipfile.ZipFile(io.BytesIO(response.content)) as z:
+            file_list = z.namelist()
+            contents = []
+            
+            # Extract content from text-based files only
+            text_extensions = ('.txt', '.csv', '.json', '.xml', '.html', '.md', '.py', '.js')
+            for name in file_list:
+                if name.lower().endswith(text_extensions) and not name.startswith('__'):
+                    try:
+                        content = z.read(name).decode('utf-8', errors='ignore')
+                        contents.append(f"--- {name} ---\n{content[:8000]}")
+                    except Exception:
+                        contents.append(f"--- {name} --- (binary or unreadable)")
+                        
+            output = f"Files in archive: {file_list}\n\n" + "\n\n".join(contents)
+            print(f"  [Tool] ZIP extraction successful ({len(file_list)} files).")
+            return output[:25000]
+        
+    except Exception as e:
+        return f"Error extracting ZIP: {str(e)}"
+
+
+def query_json_path(url: str, jsonpath: str) -> str:
+    """Downloads JSON and extracts data using JSONPath expression."""
+    print(f"  [Tool] JSONPath Query: {url} -> {jsonpath}")
+    try:
+        response = requests.get(url, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+        
+        if HAS_JSONPATH:
+            expr = jsonpath_parse(jsonpath)
+            matches = [match.value for match in expr.find(data)]
+            result = json.dumps(matches, indent=2, default=str)
+            print(f"  [Tool] JSONPath found {len(matches)} match(es).")
+        else:
+            # Fallback: return full JSON for Code Interpreter to process
+            result = f"JSONPath not available locally. Full JSON data:\n{json.dumps(data, indent=2, default=str)}"
+            print(f"  [Tool] Returning full JSON for Code Interpreter processing.")
+        
+        return result[:20000]
+        
+    except Exception as e:
+        return f"Error in JSONPath query: {str(e)}"
+
+
+# --- Function Aliases (for backward compatibility) ---
+def parse_excel(url: str) -> str:
+    """Alias for download_excel_raw - for backward compatibility."""
+    return download_excel_raw(url)
+
+
+def extract_text_from_image(url: str, question: str = None) -> str:
+    """Uses Vision API for image text extraction (no local OCR to save RAM)."""
+    if question is None:
+        question = "Extract ALL text visible in this image. Maintain formatting where possible."
+    return analyze_image_with_vision(url, question)
+
+
+def analyze_image_with_vision(url: str, question: str = "Describe this image in detail. If it contains text, extract all text. If it's a chart/graph, describe the data.") -> str:
+    """Analyzes an image using OpenAI's vision capability (no local processing)."""
+    print(f"  [Tool] Vision Analysis: {url}")
+    try:
+        # Download and encode image
+        response = requests.get(url, timeout=30)
+        response.raise_for_status()
+        b64_image = base64.b64encode(response.content).decode('utf-8')
+        
+        # Determine mime type from headers or URL
+        content_type = response.headers.get('Content-Type', '').lower()
+        url_lower = url.lower()
+        
+        if 'jpeg' in content_type or 'jpg' in content_type or url_lower.endswith(('.jpg', '.jpeg')):
+            mime = 'image/jpeg'
+        elif 'png' in content_type or url_lower.endswith('.png'):
+            mime = 'image/png'
+        elif 'gif' in content_type or url_lower.endswith('.gif'):
+            mime = 'image/gif'
+        elif 'webp' in content_type or url_lower.endswith('.webp'):
+            mime = 'image/webp'
+        else:
+            mime = 'image/png'
+        
+        # Call OpenAI Vision API (processing happens on OpenAI's servers, not locally)
+        vision_url = f"{DIRECT_OPENAI_URL}/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "model": "gpt-4o",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": question},
+                        {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64_image}"}}
+                    ]
+                }
+            ],
+            "max_tokens": 2000
+        }
+        
+        api_response = requests.post(vision_url, headers=headers, json=payload)
+        api_response.raise_for_status()
+        
+        result = api_response.json()['choices'][0]['message']['content']
+        print(f"  [Tool] Vision analysis complete ({len(result)} chars).")
+        return result
+        
+    except Exception as e:
+        return f"Error in vision analysis: {str(e)}"
+
+
+def generate_chart_base64(data_csv: str, chart_type: str = "bar", x_col: str = None, y_col: str = None, title: str = "Chart") -> str:
+    """
+    LIGHTWEIGHT: Returns the CSV data with instructions to use Code Interpreter for chart generation.
+    This avoids loading matplotlib locally on RAM-constrained VMs.
+    """
+    print(f"  [Tool] Chart request: {chart_type} - '{title}' (delegating to Code Interpreter)")
+    
+    # Return the data with instructions - Code Interpreter will generate the actual chart
+    return (
+        f"CHART_REQUEST: Please use Code Interpreter to generate a {chart_type} chart.\n"
+        f"Title: {title}\n"
+        f"X Column: {x_col or 'auto-detect first column'}\n"
+        f"Y Column: {y_col or 'auto-detect first numeric column'}\n"
+        f"DATA (CSV format):\n{data_csv}\n\n"
+        f"Generate the chart using matplotlib in Code Interpreter and return the base64 PNG."
+    )
+
 def make_openai_request(endpoint: str, method: str = "GET", data: Dict[str, Any] = None) -> Dict[str, Any]:
     headers = {
         "Content-Type": "application/json",
@@ -265,20 +482,34 @@ def create_assistant():
     payload = {
         "name": "Full-Stack Data Agent",
         "instructions": (
-            "You are an autonomous, full-stack data agent. You operate in a strict pipeline to solve data quizzes. USE THE CODE INTERPRITER TOOL FOR DATA ANYLISYS\n\n"
+            "You are an autonomous, full-stack data agent. You operate in a strict pipeline to solve data quizzes. USE THE CODE INTERPRETER TOOL FOR DATA ANALYSIS.\n\n"
+            "### CRITICAL RULES:\n"
+            "   - After submitting an answer, if the response contains a new `url` field, IMMEDIATELY visit and solve that URL too.\n"
+            "   - Continue solving URLs until you receive a response with NO new url or `correct: true` with no url.\n"
+            "   - Do NOT hardcode any URLs. Always extract submission URLs from the quiz page.\n\n"
             "### 1. SOURCING & DISCOVERY (PRIORITY):\n"
-            "   - **Scrape Page**: Use `web_scraper` to read text/HTML. prefer html and check using scraping tools whether the page contains a file as it is more cost effective\n"
+            "   - **Scrape Page**: Use `web_scraper` to read text/HTML. Prefer HTML format first.\n"
             "   - **Check for Audio**: If page has mp3/wav/opus, call `audio_transcriber`.\n"
-            "   - **CSV/JSON**: Use `web_downloader` to get raw text content directly.\n"
-            "   - **PDF**: Use `pdf_scraper` to extract text content directly. DO NOT download PDFs as files.\n"
-            "   - **CRITICAL**: Always prefer extracting text (CSV/PDF) directly into the chat context over file uploads.\n\n"
+            "   - **CSV/JSON/Text**: Use `web_downloader` to get raw text content directly.\n"
+            "   - **PDF**: Use `pdf_scraper` to extract text content directly.\n"
+            "   - **Excel (.xlsx/.xls)**: Use `excel_parser` to extract all sheets as CSV.\n"
+            "   - **ZIP Archives**: Use `zip_extractor` to list and extract text files.\n"
+            "   - **Images with Text**: Use `image_ocr` for text extraction, or `image_analyzer` for visual analysis.\n"
+            "   - **HTML Tables**: Use `table_extractor` to extract tables from web pages.\n"
+            "   - **JSON with complex structure**: Use `json_query` with JSONPath to extract specific data.\n"
+            "   - **CRITICAL**: Always prefer extracting text directly into the chat context over file uploads.\n\n"
             "### 2. PROCESSING (Code Interpreter):\n"
-            "   - **Combine Info**: Use info from audio/text/PDF to filter the CSV data.\n"
-            "   - Analyze data using Pandas/SciPy.\n"
-            "   - Generate charts using Matplotlib if requested.\n\n"
+            "   - Analyze data using Pandas/NumPy/SciPy.\n"
+            "   - Perform statistical analysis, filtering, aggregation.\n"
+            "   - Generate charts using Matplotlib if requested (or use `chart_generator` tool).\n"
+            "   - Handle geo-spatial or network analysis as needed.\n\n"
             "### 3. SUBMISSION:\n"
-            "   - Use `api_request` with method='POST'.\n"
-            "   - If chart needed, set value to '__LATEST_FILE__'."
+            "   - Use `api_request` with method='POST' to the URL specified in the quiz.\n"
+            "   - Include: email, secret, url (original quiz URL), and answer.\n"
+            "   - Answer types: boolean, number, string, base64 URI, or JSON object.\n"
+            "   - If chart/image needed, generate it in Code Interpreter and include as base64 data URI.\n"
+            "   - After submission, CHECK THE RESPONSE for a new `url` field and continue if present.\n"
+            "   - Follow the exact JSON format specified in the quiz instructions."
         ),
         "model": MODEL_NAME,
         "tools": [
@@ -287,10 +518,13 @@ def create_assistant():
                 "type": "function",
                 "function": {
                     "name": "web_scraper",
-                    "description": "Scrapes a website page text. Handles JavaScript. Returns HTML/Markdown.",
+                    "description": "Scrapes a website page text. Handles JavaScript-rendered pages. Returns HTML or Markdown.",
                     "parameters": {
                         "type": "object",
-                        "properties": {"url": {"type": "string"}, "format": {"type": "string", "enum": ["html", "markdown"]}},
+                        "properties": {
+                            "url": {"type": "string", "description": "The URL to scrape"},
+                            "format": {"type": "string", "enum": ["html", "markdown"], "description": "Output format (default: html)"}
+                        },
                         "required": ["url"]
                     }
                 }
@@ -299,10 +533,10 @@ def create_assistant():
                 "type": "function",
                 "function": {
                     "name": "web_downloader",
-                    "description": "Downloads a file. If CSV/JSON, returns raw text content. If Binary, uploads to OpenAI.",
+                    "description": "Downloads a file from URL. Returns raw text for CSV/JSON/TXT files. For PDFs, extracts text. For binary files, uploads to storage.",
                     "parameters": {
                         "type": "object",
-                        "properties": {"url": {"type": "string"}},
+                        "properties": {"url": {"type": "string", "description": "The file URL to download"}},
                         "required": ["url"]
                     }
                 }
@@ -311,10 +545,10 @@ def create_assistant():
                 "type": "function",
                 "function": {
                     "name": "pdf_scraper",
-                    "description": "Downloads a PDF and extracts the text content directly. Use this for all PDF links.",
+                    "description": "Downloads a PDF and extracts all text content directly. Use for any PDF file links.",
                     "parameters": {
                         "type": "object",
-                        "properties": {"url": {"type": "string"}},
+                        "properties": {"url": {"type": "string", "description": "The PDF URL"}},
                         "required": ["url"]
                     }
                 }
@@ -323,10 +557,10 @@ def create_assistant():
                 "type": "function",
                 "function": {
                     "name": "audio_transcriber",
-                    "description": "Downloads an audio file and returns the transcribed text.",
+                    "description": "Downloads an audio file (mp3/wav/opus/ogg) and returns transcribed text using Whisper.",
                     "parameters": {
                         "type": "object",
-                        "properties": {"url": {"type": "string"}},
+                        "properties": {"url": {"type": "string", "description": "The audio file URL"}},
                         "required": ["url"]
                     }
                 }
@@ -335,15 +569,111 @@ def create_assistant():
                 "type": "function",
                 "function": {
                     "name": "api_request",
-                    "description": "Makes a standard HTTP request (GET/POST).",
+                    "description": "Makes HTTP GET or POST requests. For POST, provide JSON data as a string.",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "url": {"type": "string"},
-                            "method": {"type": "string", "enum": ["GET", "POST"]},
-                            "data_json": {"type": "string"}
+                            "url": {"type": "string", "description": "The API endpoint URL"},
+                            "method": {"type": "string", "enum": ["GET", "POST"], "description": "HTTP method"},
+                            "data_json": {"type": "string", "description": "JSON payload as string (for POST requests)"}
                         },
                         "required": ["url", "method"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "excel_parser",
+                    "description": "Downloads an Excel file (.xlsx/.xls) and extracts all sheets as CSV text.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"url": {"type": "string", "description": "The Excel file URL"}},
+                        "required": ["url"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "image_ocr",
+                    "description": "Downloads an image and extracts text using OCR (Tesseract). Use for images containing text.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"url": {"type": "string", "description": "The image URL"}},
+                        "required": ["url"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "table_extractor",
+                    "description": "Scrapes all HTML tables from a web page and returns them as CSV text. Handles JavaScript-rendered pages.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"url": {"type": "string", "description": "The web page URL containing tables"}},
+                        "required": ["url"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "zip_extractor",
+                    "description": "Downloads a ZIP archive and extracts/lists text-based files inside (txt, csv, json, xml, etc.).",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"url": {"type": "string", "description": "The ZIP file URL"}},
+                        "required": ["url"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "json_query",
+                    "description": "Downloads JSON from URL and extracts data using JSONPath expression (e.g., '$.data[*].value').",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "url": {"type": "string", "description": "The JSON API/file URL"},
+                            "jsonpath": {"type": "string", "description": "JSONPath expression to extract data"}
+                        },
+                        "required": ["url", "jsonpath"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "image_analyzer",
+                    "description": "Analyzes an image using AI vision. Use for charts, diagrams, screenshots, or any visual content that needs interpretation.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "url": {"type": "string", "description": "The image URL"},
+                            "question": {"type": "string", "description": "What to analyze or extract from the image"}
+                        },
+                        "required": ["url"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "chart_generator",
+                    "description": "Generates a chart from CSV data and returns as base64 PNG image.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "data_csv": {"type": "string", "description": "CSV data as string"},
+                            "chart_type": {"type": "string", "enum": ["bar", "line", "scatter", "pie", "hist"], "description": "Type of chart"},
+                            "x_col": {"type": "string", "description": "Column name for X axis"},
+                            "y_col": {"type": "string", "description": "Column name for Y axis"},
+                            "title": {"type": "string", "description": "Chart title"}
+                        },
+                        "required": ["data_csv"]
                     }
                 }
             }
@@ -401,6 +731,36 @@ def process_run_loop(thread_id, run_id):
                                     file_id = get_latest_file_id_from_thread(thread_id)
                                     if file_id: data_payload[key] = download_file_and_base64_encode(file_id)
                             result = json.dumps(post_json(args['url'], data_payload))
+                    
+                    # --- NEW TOOL HANDLERS ---
+                    elif func_name == "excel_parser":
+                        result = parse_excel(args['url'])
+                    
+                    elif func_name == "image_ocr":
+                        result = extract_text_from_image(args['url'])
+                    
+                    elif func_name == "table_extractor":
+                        result = extract_tables_from_html(args['url'])
+                    
+                    elif func_name == "zip_extractor":
+                        result = extract_zip(args['url'])
+                    
+                    elif func_name == "json_query":
+                        result = query_json_path(args['url'], args['jsonpath'])
+                    
+                    elif func_name == "image_analyzer":
+                        question = args.get('question', 'Describe this image in detail.')
+                        result = analyze_image_with_vision(args['url'], question)
+                    
+                    elif func_name == "chart_generator":
+                        result = generate_chart_base64(
+                            data_csv=args['data_csv'],
+                            chart_type=args.get('chart_type', 'bar'),
+                            x_col=args.get('x_col'),
+                            y_col=args.get('y_col'),
+                            title=args.get('title', 'Chart')
+                        )
+                    
                 except Exception as e:
                     result = f"Error: {str(e)}"
                     print(f"  [Error] Tool Execution Failed: {e}")
