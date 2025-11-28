@@ -13,6 +13,7 @@ from flask_cors import CORS
 from werkzeug.exceptions import BadRequest
 
 from aiTest import solve_quiz_question
+from asgiref.wsgi import WsgiToAsgi
 
 dotenv.load_dotenv()
 
@@ -109,6 +110,7 @@ def create_app(config: dict | None = None) -> Flask:
 
 
 app = create_app()
+asgi_app = WsgiToAsgi(app)
 
 
 if __name__ == "__main__":
